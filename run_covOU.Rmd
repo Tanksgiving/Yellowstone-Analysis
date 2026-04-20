@@ -1,0 +1,956 @@
+---
+title: "yellowstone covou analysis"
+output: html_document
+---
+
+# setup
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE
+)
+```
+
+# paths and packages
+
+```{r paths-and-packages}
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+set.seed(2024)
+
+project_dir <- "C:/Users/maata/Downloads/DRSTERNER/paleoTS_project/paleoTS/paleoTS/"
+root_dir    <- "C:/Users/maata/Downloads/DRSTERNER"
+
+trait_paths <- list(
+  Diameter = file.path(root_dir, "Theriot et al 2006 dia.txt"),
+  Ribs     = file.path(root_dir, "Theriot et al 2006 ribs.txt"),
+  Spines   = file.path(root_dir, "Theriot et al 2006 spines.txt")
+)
+
+pollen_path <- file.path(root_dir, "Theriot2006-PinusContortusPollenData.csv")
+inso_path   <- file.path(root_dir, "inso_June.txt")
+
+output_dir <- file.path(root_dir, "covOU_state_space_outputs")
+fig_dir    <- file.path(output_dir, "figures")
+tab_dir    <- file.path(output_dir, "tables")
+rds_dir    <- file.path(output_dir, "rds")
+
+# these values control the  adequacy runs and the variance-shift sensitivity fits
+pool_models <- FALSE
+nboot_baseline <- 250L
+nboot_covou <- 250L
+nboot_sensitivity <- 200L
+vshift_breaks_bp <- c(11000)
+
+load_required_packages <- function(pkgs) {
+  missing <- pkgs[!vapply(pkgs, requireNamespace, quietly = TRUE, FUN.VALUE = logical(1))]
+  if (length(missing) > 0) {
+    stop("install these packages before running: ", paste(missing, collapse = ", "))
+  }
+  invisible(lapply(pkgs, library, character.only = TRUE))
+}
+
+load_required_packages(c(
+  "devtools", "paleoTS", "dplyr", "purrr", "tibble", "tidyr", "ggplot2",
+  "readr", "stringr", "knitr"
+))
+
+setwd(project_dir)
+devtools::load_all(project_dir, quiet = TRUE)
+
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(tab_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(rds_dir, showWarnings = FALSE, recursive = TRUE)
+
+message("starting yellowstone covou analysis")
+```
+
+# helper functions
+
+helper functions  
+```{r helper-functions}
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
+safe_read_table <- function(path, ...) {
+  if (!file.exists(path)) stop("File not found: ", path)
+  read.table(path, ...)
+}
+
+safe_read_csv <- function(path, ...) {
+  if (!file.exists(path)) stop("File not found: ", path)
+  read.csv(path, ...)
+}
+
+# these functions build the model-comparison tables after each set of fits is finished
+make_aicc <- function(logL, K, n) {
+  -2 * logL + 2 * K + (2 * K * (K + 1)) / (n - K - 1)
+}
+
+empty_model_table <- function() {
+  tibble(
+    Trait = character(),
+    Analysis_Set = character(),
+    Model = character(),
+    logL = numeric(),
+    K = integer(),
+    n = integer(),
+    AICc = numeric(),
+    deltaAICc = numeric(),
+    weight = numeric()
+  )
+}
+
+safe_bind_rows <- function(x) {
+  x <- purrr::compact(x)
+  if (length(x) == 0) return(tibble::tibble())
+  dplyr::bind_rows(x)
+}
+
+add_ic_columns <- function(df, n_col = "n") {
+  if (is.null(df) || nrow(df) == 0) return(empty_model_table())
+  df %>%
+    mutate(
+      AICc = make_aicc(logL = .data$logL, K = .data$K, n = .data[[n_col]])
+    ) %>%
+    group_by(Trait, Analysis_Set) %>%
+    arrange(AICc, .by_group = TRUE) %>%
+    mutate(
+      deltaAICc = AICc - min(AICc, na.rm = TRUE),
+      weight = exp(-0.5 * deltaAICc) / sum(exp(-0.5 * deltaAICc), na.rm = TRUE)
+    ) %>%
+    ungroup()
+}
+
+# these summary statistics are used for the bootstrap adequacy checks
+half_life_from_alpha <- function(alpha) {
+  ifelse(is.na(alpha) | alpha <= 0, NA_real_, log(2) / alpha)
+}
+
+safe_acf1 <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) < 3) return(NA_real_)
+  stats::acf(x, lag.max = 1, plot = FALSE, na.action = na.pass)$acf[2]
+}
+
+runs_z_stat <- function(x) {
+  x <- x[is.finite(x)]
+  x <- x[x != 0]
+  if (length(x) < 10) return(NA_real_)
+  signs <- ifelse(x > 0, 1L, 0L)
+  n1 <- sum(signs == 1L)
+  n0 <- sum(signs == 0L)
+  if (n1 == 0L || n0 == 0L) return(NA_real_)
+  runs <- 1L + sum(signs[-1] != signs[-length(signs)])
+  mu <- (2 * n1 * n0) / (n1 + n0) + 1
+  vr <- (2 * n1 * n0 * (2 * n1 * n0 - n1 - n0)) /
+    (((n1 + n0)^2) * (n1 + n0 - 1))
+  if (!is.finite(vr) || vr <= 0) return(NA_real_)
+  (runs - mu) / sqrt(vr)
+}
+
+var_ratio_early_late <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) < 8) return(NA_real_)
+  idx <- floor(length(x) / 2)
+  x1 <- x[seq_len(idx)]
+  x2 <- x[(idx + 1):length(x)]
+  v1 <- stats::var(x1)
+  v2 <- stats::var(x2)
+  if (!is.finite(v1) || !is.finite(v2) || v2 <= 0) return(NA_real_)
+  v1 / v2
+}
+
+standardized_innovations <- function(fit) {
+  if (is.null(fit$kf$innov) || is.null(fit$kf$sig)) {
+    return(rep(NA_real_, length(fit$parameters)))
+  }
+  innov <- as.numeric(fit$kf$innov)
+  sig <- sqrt(as.numeric(fit$kf$sig))
+  sig[!is.finite(sig) | sig <= 0] <- NA_real_
+  innov / sig
+}
+
+adequacy_stats <- function(fit) {
+  z <- standardized_innovations(fit)
+  c(
+    mean = mean(z, na.rm = TRUE),
+    variance = stats::var(z, na.rm = TRUE),
+    acf1 = safe_acf1(z),
+    runs_z = runs_z_stat(z),
+    early_late_var_ratio = var_ratio_early_late(z)
+  )
+}
+
+two_sided_boot_p <- function(obs, sims) {
+  sims <- sims[is.finite(sims)]
+  if (!is.finite(obs) || length(sims) < 10) return(NA_real_)
+  cdf <- mean(sims <= obs)
+  2 * min(cdf, 1 - cdf)
+}
+
+# these functions pull fitted values and parameters out of the paleoTSfit objects
+extract_state_fit <- function(fit) {
+  tibble(
+    fitted = as.numeric(fit$kf$xf[1, 1, ]),
+    var_f = as.numeric(fit$kf$Pf[1, 1, ])
+  )
+}
+
+extract_parameter_summary <- function(fit, trait, model, analysis_set) {
+  pp <- fit$parameters
+  tibble(
+    Trait = trait,
+    Analysis_Set = analysis_set,
+    Model = model,
+    anc = unname(pp["anc"] %||% NA_real_),
+    theta = unname(pp["theta"] %||% NA_real_),
+    vstep = unname(pp["vstep"] %||% NA_real_),
+    vstep1 = unname(pp["vstep1"] %||% NA_real_),
+    vstep2 = unname(pp["vstep2"] %||% NA_real_),
+    alpha = unname(pp["alpha"] %||% NA_real_),
+    half_life = half_life_from_alpha(unname(pp["alpha"] %||% NA_real_)),
+    b0 = unname(pp["b0"] %||% NA_real_),
+    b1 = unname(pp["b1"] %||% NA_real_),
+    b2 = unname(pp["b2"] %||% NA_real_),
+    mstep = unname(pp["mstep"] %||% NA_real_),
+    omega = unname(pp["omega"] %||% NA_real_),
+    r = unname(pp["r"] %||% NA_real_),
+    logL = fit$logL,
+    K = fit$K
+  )
+}
+
+build_segment_groups_bp <- function(time_bp, breaks_bp) {
+  if (length(breaks_bp) == 0) return(rep(1L, length(time_bp)))
+  breaks_bp <- sort(unique(breaks_bp), decreasing = TRUE)
+  1L + rowSums(outer(time_bp, breaks_bp, `<=`))
+}
+
+
+# reads one trait series, builds the additive/log objects and interpolates the pollen and insolation series to the same time grid
+prep_trait_series <- function(trait_file,
+                              pollen_df,
+                              inso_df,
+                              label,
+                              trait_sep = "\t") {
+  tr <- safe_read_table(trait_file, header = TRUE, sep = trait_sep, check.names = FALSE)
+
+  req_cols <- c("mm", "vv", "N", "age")
+  miss <- setdiff(req_cols, names(tr))
+  if (length(miss) > 0) {
+    stop("Trait file is missing required columns: ", paste(miss, collapse = ", "),
+         " in file ", trait_file)
+  }
+
+  ts_add <- as.paleoTS(
+    mm = tr$mm,
+    vv = tr$vv,
+    nn = tr$N,
+    tt = tr$age,
+    label = label
+  )
+
+  ts_log <- ln.paleoTS(ts_add)
+  time_bp <- ts_add$start.age - ts_add$tt
+
+  # the new ssm code centers covariates internally, so the raw interpolated
+  # covariates are passed in here and then centered inside the fitter
+  pollen_interp <- stats::approx(
+    x = pollen_df$Years,
+    y = pollen_df$Prop,
+    xout = time_bp,
+    rule = 2
+  )$y
+
+  inso_interp <- stats::approx(
+    x = inso_df$Years,
+    y = inso_df$Inso,
+    xout = time_bp,
+    rule = 2
+  )$y
+
+  tibble_cov <- tibble(
+    time_bp = time_bp,
+    time_kyr_bp = time_bp / 1000,
+    pollen_prop = pollen_interp,
+    inso_june = inso_interp
+  )
+
+  list(
+    label = label,
+    additive = ts_add,
+    log = ts_log,
+    covariates = tibble_cov,
+    Z_inso = matrix(tibble_cov$inso_june, ncol = 1, dimnames = list(NULL, "Insolation")),
+    Z_poll = matrix(tibble_cov$pollen_prop, ncol = 1, dimnames = list(NULL, "Pollen")),
+    Z_both = cbind(
+      Insolation = tibble_cov$inso_june,
+      Pollen = tibble_cov$pollen_prop
+    ),
+    Z_time = matrix(tibble_cov$time_kyr_bp, ncol = 1, dimnames = list(NULL, "Time_kyrBP"))
+  )
+}
+
+# ordinary least squares is kept only as a descriptive comparison and is not
+# included in the stochastic model ranking
+fit_ols_baseline <- function(y, Z, model_label = "OLS_both") {
+  df <- data.frame(y = y$mm, Z)
+  fit <- lm(y ~ ., data = df)
+  n <- length(y$mm)
+  K <- length(coef(fit))
+  LL <- as.numeric(logLik(fit))
+  tibble(Model = model_label, logL = LL, K = K, n = n,
+         AICc = make_aicc(LL, K, n))
+}
+
+# hessian refinement is only used where the current build is stable enough
+# to return a variance-covariance matrix
+supports_hessian_refinement <- function(model_id) {
+  !model_id %in% c(
+    "covOU_inso", "covOU_poll", "covOU_both", "timeOU",
+    "covOU_inso_vshift", "covOU_both_vshift"
+  )
+}
+
+# the covariate-ou fits use simple parscale settings so the optimizers are
+# not relying on getAllParscale for the transformed parameter names
+build_model_control <- function(model_id, gg = NULL) {
+  cl <- list(fnscale = -1, maxit = 5000)
+  if (model_id %in% c("covOU_inso", "covOU_poll", "timeOU")) {
+    cl$parscale <- rep(1, 5L)
+  } else if (model_id == "covOU_both") {
+    cl$parscale <- rep(1, 6L)
+  } else if (model_id == "covOU_inso_vshift") {
+    nseg <- max(gg)
+    cl$parscale <- rep(1, nseg + 4L)
+  } else if (model_id == "covOU_both_vshift") {
+    nseg <- max(gg)
+    cl$parscale <- rep(1, nseg + 5L)
+  }
+  cl
+}
+
+# this is the main function used throughout the notebook to call the
+# appropriate state-space fitter for each candidate model
+fit_single_model <- function(model_id, y, Z_map, pool = FALSE, hess = FALSE, gg = NULL) {
+  cl <- build_model_control(model_id = model_id, gg = gg)
+
+  if (isTRUE(hess) && !supports_hessian_refinement(model_id)) {
+    hess <- FALSE
+  }
+
+  switch(
+    model_id,
+    "Stasis" = opt.ssm.Stasis(y = y, pool = pool, hess = hess, cl = cl),
+    "URW" = opt.ssm.URW(y = y, pool = pool, hess = hess, cl = cl),
+    "GRW" = opt.ssm.GRW(y = y, pool = pool, hess = hess, cl = cl),
+    "OU" = opt.ssm.OU(y = y, pool = pool, hess = hess, cl = cl),
+    "ACDC" = opt.ssm.ACDC(y = y, pool = pool, hess = hess, cl = cl),
+    "covOU_inso" = opt.ssm.covOU(y = y, Z = Z_map$Z_inso, pool = pool, hess = hess, cl = cl),
+    "covOU_poll" = opt.ssm.covOU(y = y, Z = Z_map$Z_poll, pool = pool, hess = hess, cl = cl),
+    "covOU_both" = opt.ssm.covOU(y = y, Z = Z_map$Z_both, pool = pool, hess = hess, cl = cl),
+    "timeOU" = opt.ssm.covOU(y = y, Z = Z_map$Z_time, pool = pool, hess = hess, cl = cl),
+    "URW_shift" = opt.ssm.URWshift(y = y, gg = gg, pool = pool, hess = hess, cl = cl),
+    "covOU_inso_vshift" = opt.ssm.covOU_vshift(y = y, Z = Z_map$Z_inso, gg = gg, pool = pool, hess = hess, cl = cl),
+    "covOU_both_vshift" = opt.ssm.covOU_vshift(y = y, Z = Z_map$Z_both, gg = gg, pool = pool, hess = hess, cl = cl),
+    stop("Unknown model_id: ", model_id)
+  )
+}
+
+safe_fit_model <- function(...) {
+  tryCatch(
+    fit_single_model(...),
+    error = function(e) {
+      warning("Model fit failed: ", conditionMessage(e))
+      NULL
+    }
+  )
+}
+
+# this function fits one full model set for one trait and returns both the raw
+# fitted objects and the model-comparison table built from those fits
+fit_model_set <- function(trait_name,
+                          y,
+                          Z_map,
+                          analysis_set,
+                          model_ids,
+                          pool = FALSE,
+                          hess = FALSE,
+                          gg = NULL) {
+  fits <- purrr::set_names(vector("list", length(model_ids)), model_ids)
+  for (mid in model_ids) {
+    message("fitting ", analysis_set, " for ", trait_name, ": ", mid)
+    fits[[mid]] <- safe_fit_model(model_id = mid, y = y, Z_map = Z_map, pool = pool, hess = hess, gg = gg)
+  }
+
+  tab_list <- purrr::imap(fits, function(fit, nm) {
+    if (is.null(fit)) return(NULL)
+    tibble(
+      Trait = trait_name,
+      Analysis_Set = analysis_set,
+      Model = nm,
+      logL = fit$logL,
+      K = fit$K,
+      n = length(y$mm)
+    )
+  })
+  tab <- safe_bind_rows(tab_list)
+
+  if (nrow(tab) == 0) return(list(table = empty_model_table(), fits = fits))
+  list(table = add_ic_columns(tab, n_col = "n"), fits = fits)
+}
+
+# simulation is done on the observed time grid so the bootstrap adequacy checks
+# use the same interval and the same observation variances as the data
+simulate_fitted_ssm <- function(y, fit, model_id, Z_map, gg = NULL) {
+  n <- length(y$mm)
+  dt <- c(0, diff(y$tt))
+  obs_var <- y$vv / y$nn
+  pp <- fit$parameters
+
+  x <- numeric(n)
+  x[1] <- unname(pp["anc"] %||% y$mm[1])
+
+  if (model_id == "Stasis") {
+    theta <- unname(pp["theta"])
+    omega <- unname(pp["omega"])
+    x <- rnorm(n, mean = theta, sd = sqrt(max(omega, 0)))
+  } else if (model_id == "URW") {
+    vs <- unname(pp["vstep"])
+    for (i in 2:n) x[i] <- x[i - 1] + rnorm(1, 0, sqrt(max(vs * dt[i], 0)))
+  } else if (model_id == "GRW") {
+    vs <- unname(pp["vstep"])
+    ms <- unname(pp["mstep"])
+    for (i in 2:n) x[i] <- x[i - 1] + ms * dt[i] + rnorm(1, 0, sqrt(max(vs * dt[i], 0)))
+  } else if (model_id == "OU") {
+    vs <- unname(pp["vstep"])
+    alpha <- unname(pp["alpha"])
+    theta <- unname(pp["theta"])
+    for (i in 2:n) {
+      G <- exp(-alpha * dt[i])
+      Q <- (vs / (2 * alpha)) * (1 - exp(-2 * alpha * dt[i]))
+      x[i] <- G * x[i - 1] + (1 - G) * theta + rnorm(1, 0, sqrt(max(Q, 0)))
+    }
+  } else if (model_id == "ACDC") {
+    vs0 <- unname(pp["vstep0"] %||% pp["vstep"])
+    r <- unname(pp["r"])
+    si <- y$tt - y$tt[1]
+    if (abs(r) < 1e-10) {
+      Qinc <- vs0 * dt
+    } else {
+      V <- vs0 * (expm1(r * si) / r)
+      Qinc <- c(0, diff(V))
+    }
+    for (i in 2:n) x[i] <- x[i - 1] + rnorm(1, 0, sqrt(max(Qinc[i], 0)))
+  } else if (model_id %in% c("covOU_inso", "covOU_poll", "covOU_both", "timeOU")) {
+    vs <- unname(pp["vstep"])
+    alpha <- unname(pp["alpha"])
+    Z <- switch(
+      model_id,
+      "covOU_inso" = Z_map$Z_inso,
+      "covOU_poll" = Z_map$Z_poll,
+      "covOU_both" = Z_map$Z_both,
+      "timeOU" = Z_map$Z_time
+    )
+    Zc <- scale(Z, center = TRUE, scale = FALSE)
+    slope_names <- grep("^b[0-9]+$", names(pp), value = TRUE)
+    slope_names <- setdiff(slope_names, "b0")
+    slope_names <- slope_names[order(as.integer(sub("^b", "", slope_names)))]
+    theta_t <- unname(pp["b0"]) + as.vector(Zc %*% matrix(unname(pp[slope_names]), ncol = 1))
+    for (i in 2:n) {
+      G <- exp(-alpha * dt[i])
+      Q <- (vs / (2 * alpha)) * (1 - exp(-2 * alpha * dt[i]))
+      x[i] <- G * x[i - 1] + (1 - G) * theta_t[i] + rnorm(1, 0, sqrt(max(Q, 0)))
+    }
+  } else if (model_id == "URW_shift") {
+    for (i in 2:n) {
+      vsi <- unname(pp[paste0("vstep", gg[i])])
+      x[i] <- x[i - 1] + rnorm(1, 0, sqrt(max(vsi * dt[i], 0)))
+    }
+  } else if (model_id %in% c("covOU_inso_vshift", "covOU_both_vshift")) {
+    alpha <- unname(pp["alpha"])
+    Z <- if (model_id == "covOU_inso_vshift") Z_map$Z_inso else Z_map$Z_both
+    Zc <- scale(Z, center = TRUE, scale = FALSE)
+    slope_names <- grep("^b[0-9]+$", names(pp), value = TRUE)
+    slope_names <- setdiff(slope_names, "b0")
+    slope_names <- slope_names[order(as.integer(sub("^b", "", slope_names)))]
+    theta_t <- unname(pp["b0"]) + as.vector(Zc %*% matrix(unname(pp[slope_names]), ncol = 1))
+    for (i in 2:n) {
+      vsi <- unname(pp[paste0("vstep", gg[i])])
+      G <- exp(-alpha * dt[i])
+      Q <- (vsi / (2 * alpha)) * (1 - exp(-2 * alpha * dt[i]))
+      x[i] <- G * x[i - 1] + (1 - G) * theta_t[i] + rnorm(1, 0, sqrt(max(Q, 0)))
+    }
+  } else {
+    stop("No simulation rule written for model: ", model_id)
+  }
+
+  y_obs <- x + stats::rnorm(n, mean = 0, sd = sqrt(pmax(obs_var, 0)))
+
+  as.paleoTS(
+    mm = y_obs,
+    vv = y$vv,
+    nn = y$nn,
+    tt = y$tt,
+    label = paste0(y$label, "_sim"),
+    reset.time = FALSE
+  )
+}
+
+# refits a model to bootstrap simulations and compares the observed
+# innovation summaries to the bootstrap distribution of the same summaries
+bootstrap_adequacy <- function(trait_name,
+                               model_id,
+                               fit,
+                               y,
+                               Z_map,
+                               B = 250L,
+                               gg = NULL,
+                               pool = FALSE,
+                               seed = 2024) {
+  set.seed(seed)
+  message("bootstrap adequacy for ", trait_name, ": ", model_id)
+
+  obs <- adequacy_stats(fit)
+  sim_stats <- matrix(NA_real_, nrow = B, ncol = length(obs),
+                      dimnames = list(NULL, names(obs)))
+
+  for (b in seq_len(B)) {
+    yb <- tryCatch(simulate_fitted_ssm(y = y, fit = fit, model_id = model_id, Z_map = Z_map, gg = gg),
+                   error = function(e) NULL)
+    if (is.null(yb)) next
+
+    fb <- tryCatch(
+      fit_single_model(model_id = model_id, y = yb, Z_map = Z_map, pool = pool, hess = FALSE, gg = gg),
+      error = function(e) NULL
+    )
+    if (is.null(fb)) next
+
+    sim_stats[b, ] <- adequacy_stats(fb)
+  }
+
+  tibble(
+    Trait = trait_name,
+    Model = model_id,
+    Statistic = names(obs),
+    Observed = unname(obs),
+    Bootstrap_Median = apply(sim_stats, 2, stats::median, na.rm = TRUE),
+    Bootstrap_Mean = apply(sim_stats, 2, mean, na.rm = TRUE),
+    P_two_sided = purrr::map2_dbl(obs, seq_along(obs), ~ two_sided_boot_p(.x, sim_stats[, .y]))
+  )
+}
+
+# these plotting helpers save the fitted trajectories and model-weight summaries
+make_obs_fit_plot <- function(prep, fit, trait_name, model_name, scale_label, out_path) {
+  sf <- extract_state_fit(fit)
+  df <- tibble(
+    Time_BP = prep$covariates$time_bp,
+    Observed = fit$kf$xp[1, 1, ] * NA_real_,
+    Fitted = sf$fitted,
+    Var_f = sf$var_f
+  )
+
+  y_obs <- if (scale_label == "additive") prep$additive$mm else prep$log$mm
+  df$Observed <- y_obs
+  df$Lower <- df$Fitted - 1.96 * sqrt(pmax(df$Var_f, 0))
+  df$Upper <- df$Fitted + 1.96 * sqrt(pmax(df$Var_f, 0))
+
+  p <- ggplot(df, aes(x = Time_BP)) +
+    geom_ribbon(aes(ymin = Lower, ymax = Upper), alpha = 0.18) +
+    geom_line(aes(y = Fitted), linewidth = 0.9) +
+    geom_point(aes(y = Observed), size = 1.3) +
+    scale_x_reverse() +
+    theme_minimal(base_size = 13) +
+    labs(
+      title = paste0(trait_name, ": ", model_name, " (", scale_label, ")"),
+      x = "Time (years BP)",
+      y = ifelse(scale_label == "additive", trait_name, paste0("log(", trait_name, ")"))
+    )
+
+  ggplot2::ggsave(out_path, p, width = 8, height = 4.5, dpi = 300)
+  invisible(p)
+}
+
+make_weight_plot <- function(df, out_path) {
+  if (is.null(df) || nrow(df) == 0) return(invisible(NULL))
+  p <- df %>%
+    mutate(Model = factor(Model, levels = unique(Model))) %>%
+    ggplot(aes(x = Model, y = weight, fill = Model)) +
+    geom_col(width = 0.75) +
+    facet_wrap(~ Trait, nrow = 1, scales = "free_x") +
+    coord_cartesian(ylim = c(0, 1)) +
+    theme_minimal(base_size = 13) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "none"
+    ) +
+    labs(x = NULL, y = "Akaike weight", title = unique(df$Analysis_Set))
+
+  ggplot2::ggsave(out_path, p, width = 10, height = 4.5, dpi = 300)
+  invisible(p)
+}
+```
+
+# covariates and trait series
+
+```{r covariates-and-traits}
+pollen_raw <- safe_read_csv(pollen_path, skip = 3, header = TRUE, check.names = FALSE)
+names(pollen_raw) <- c("Years", "Pcent")
+pollen_df <- pollen_raw %>% mutate(Prop = Pcent / 100)
+
+inso_raw <- safe_read_table(inso_path, header = TRUE, check.names = FALSE)
+names(inso_raw) <- c("ky", "Inso")
+
+#  the same insolation time conversion
+inso_df <- inso_raw %>% transmute(Years = -ky * 1000, Inso = Inso)
+
+prep_map <- list(
+  Diameter = prep_trait_series(trait_paths$Diameter, pollen_df, inso_df, label = "Diameter"),
+  Ribs = prep_trait_series(trait_paths$Ribs, pollen_df, inso_df, label = "Ribs"),
+  Spines = prep_trait_series(trait_paths$Spines, pollen_df, inso_df, label = "Spines")
+)
+
+# these summaries are written once so the sample sizes, age range, and basic trait
+# scale are saved with the model outputs
+trait_summary <- purrr::imap_dfr(prep_map, function(prep, nm) {
+  tibble(
+    Trait = nm,
+    n = length(prep$additive$mm),
+    age_max_bp = max(prep$covariates$time_bp, na.rm = TRUE),
+    age_min_bp = min(prep$covariates$time_bp, na.rm = TRUE),
+    mean_spacing_years = mean(diff(prep$additive$tt), na.rm = TRUE),
+    mean_trait = mean(prep$additive$mm, na.rm = TRUE),
+    sd_trait = stats::sd(prep$additive$mm, na.rm = TRUE)
+  )
+})
+
+write.csv(trait_summary, file.path(tab_dir, "trait_summary.csv"), row.names = FALSE)
+
+# the first-difference correlations are saved separately
+fdiff_df <- tibble(
+  Diameter = diff(prep_map$Diameter$additive$mm),
+  Ribs = diff(prep_map$Ribs$additive$mm),
+  Spines = diff(prep_map$Spines$additive$mm)
+)
+
+fdiff_pairs <- list(
+  c("Diameter", "Ribs"),
+  c("Diameter", "Spines"),
+  c("Ribs", "Spines")
+)
+
+fdiff_cor_table <- purrr::map_dfr(fdiff_pairs, function(vv) {
+  ct <- suppressWarnings(cor.test(fdiff_df[[vv[1]]], fdiff_df[[vv[2]]], method = "spearman", exact = FALSE))
+  tibble(
+    Trait_1 = vv[1],
+    Trait_2 = vv[2],
+    rho = unname(ct$estimate),
+    p_value = ct$p.value
+  )
+})
+
+write.csv(fdiff_cor_table, file.path(tab_dir, "first_difference_spearman_correlations.csv"), row.names = FALSE)
+
+ols_table <- bind_rows(
+  fit_ols_baseline(prep_map$Diameter$additive, prep_map$Diameter$Z_both) %>% mutate(Trait = "Diameter"),
+  fit_ols_baseline(prep_map$Ribs$additive, prep_map$Ribs$Z_both) %>% mutate(Trait = "Ribs"),
+  fit_ols_baseline(prep_map$Spines$additive, prep_map$Spines$Z_both) %>% mutate(Trait = "Spines")
+) %>% select(Trait, everything())
+
+write.csv(ols_table, file.path(tab_dir, "ols_descriptive_baselines.csv"), row.names = FALSE)
+```
+
+# model sets and fitting
+
+ defines the candidate model sets and runs the additive and log analyses
+
+```{r model-sets-and-fitting}
+baseline_models <- c("Stasis", "URW", "GRW", "OU", "ACDC")
+main_env_models <- c("covOU_inso", "covOU_poll", "covOU_both")
+main_expanded_models <- c(baseline_models, main_env_models)
+time_control_models <- c("timeOU")
+vshift_models <- c("URW_shift", "covOU_inso_vshift", "covOU_both_vshift")
+
+# this function runs the full set of fits for one trait on one scale and stores
+# the results in a list that is reused later for tables, plots, bootstraps
+run_trait_analysis <- function(prep, trait_name, scale_name = c("additive", "log")) {
+  scale_name <- match.arg(scale_name)
+  y <- if (scale_name == "additive") prep$additive else prep$log
+
+  Z_map <- list(
+    Z_inso = prep$Z_inso,
+    Z_poll = prep$Z_poll,
+    Z_both = prep$Z_both,
+    Z_time = prep$Z_time
+  )
+
+  gg_vshift <- build_segment_groups_bp(prep$covariates$time_bp, vshift_breaks_bp)
+
+  res <- list(
+    baseline = fit_model_set(trait_name, y, Z_map, paste0(scale_name, "_baseline"), baseline_models,
+                             pool = pool_models, hess = FALSE),
+    expanded = fit_model_set(trait_name, y, Z_map, paste0(scale_name, "_expanded"), main_expanded_models,
+                             pool = pool_models, hess = FALSE),
+    time_control = fit_model_set(trait_name, y, Z_map, paste0(scale_name, "_time_control"), time_control_models,
+                                 pool = pool_models, hess = FALSE),
+    vshift = fit_model_set(trait_name, y, Z_map, paste0(scale_name, "_vshift_sensitivity"), vshift_models,
+                           pool = pool_models, hess = FALSE, gg = gg_vshift),
+    gg_vshift = gg_vshift,
+    y = y,
+    Z_map = Z_map
+  )
+
+  # if the best model supports hessian refinement, refit it once more so
+  # standard errors are saved for the models where that step is stable
+  if (nrow(res$expanded$table) > 0) {
+    best_id <- res$expanded$table$Model[which.min(res$expanded$table$AICc)]
+    if (supports_hessian_refinement(best_id)) {
+      res$best_hessian <- safe_fit_model(model_id = best_id, y = y, Z_map = Z_map,
+                                         pool = pool_models, hess = TRUE)
+      res$best_hessian_id <- best_id
+    } else {
+      res$best_hessian <- NULL
+      res$best_hessian_id <- NULL
+    }
+  } else {
+    res$best_hessian <- NULL
+    res$best_hessian_id <- NULL
+  }
+
+  res
+}
+
+message("running additive-scale analysis")
+results_additive <- purrr::imap(prep_map, ~ run_trait_analysis(.x, .y, scale_name = "additive"))
+
+message("running log-scale analysis")
+results_log <- purrr::imap(prep_map, ~ run_trait_analysis(.x, .y, scale_name = "log"))
+
+results <- list(
+  additive = results_additive,
+  log = results_log
+)
+```
+
+# model tables and parameter summaries
+
+```{r tables-and-parameters}
+collect_tables <- function(result_block) {
+  tabs <- list(
+    purrr::map(result_block, ~ .x$baseline$table),
+    purrr::map(result_block, ~ .x$expanded$table),
+    purrr::map(result_block, ~ .x$time_control$table),
+    purrr::map(result_block, ~ .x$vshift$table)
+  )
+  out <- safe_bind_rows(unlist(tabs, recursive = FALSE))
+  if (nrow(out) == 0) return(empty_model_table())
+  out
+}
+
+all_tables <- safe_bind_rows(list(
+  collect_tables(results$additive),
+  collect_tables(results$log)
+))
+if (nrow(all_tables) == 0 || !all(c("Trait", "Analysis_Set", "Model") %in% names(all_tables))) {
+  all_tables <- empty_model_table()
+}
+
+write.csv(all_tables, file.path(tab_dir, "all_model_tables.csv"), row.names = FALSE)
+
+# the additive tables are written separately because these are the main-paper tables
+additive_baseline_table <- safe_bind_rows(purrr::map(results$additive, ~ .x$baseline$table))
+additive_expanded_table <- safe_bind_rows(purrr::map(results$additive, ~ .x$expanded$table))
+additive_time_table <- safe_bind_rows(purrr::map(results$additive, ~ .x$time_control$table))
+additive_vshift_table <- safe_bind_rows(purrr::map(results$additive, ~ .x$vshift$table))
+
+write.csv(additive_baseline_table, file.path(tab_dir, "additive_baseline_model_table.csv"), row.names = FALSE)
+write.csv(additive_expanded_table, file.path(tab_dir, "additive_expanded_model_table.csv"), row.names = FALSE)
+write.csv(additive_time_table, file.path(tab_dir, "additive_time_control_table.csv"), row.names = FALSE)
+write.csv(additive_vshift_table, file.path(tab_dir, "additive_vshift_sensitivity_table.csv"), row.names = FALSE)
+
+if (nrow(additive_expanded_table) > 0) {
+  make_weight_plot(additive_expanded_table, file.path(fig_dir, "additive_expanded_model_weights.png"))
+}
+
+log_expanded_table <- safe_bind_rows(purrr::map(results$log, ~ .x$expanded$table))
+write.csv(log_expanded_table, file.path(tab_dir, "log_expanded_model_table.csv"), row.names = FALSE)
+
+if (nrow(log_expanded_table) > 0) {
+  make_weight_plot(log_expanded_table, file.path(fig_dir, "log_expanded_model_weights.png"))
+}
+
+# the best row in each trait-by-analysis block is saved
+extract_best_rows <- function(df) {
+  if (is.null(df) || nrow(df) == 0) return(empty_model_table())
+  df %>%
+    group_by(Trait, Analysis_Set) %>%
+    slice_min(AICc, n = 1, with_ties = FALSE) %>%
+    ungroup()
+}
+
+best_rows <- extract_best_rows(all_tables)
+write.csv(best_rows, file.path(tab_dir, "best_model_rows.csv"), row.names = FALSE)
+
+parameter_summary <- safe_bind_rows(list(
+  purrr::imap(results$additive, function(rr, trait_name) {
+    tbl <- rr$expanded$table
+    if (nrow(tbl) == 0) return(NULL)
+    best_id <- tbl$Model[which.min(tbl$AICc)]
+    fit_obj <- rr$expanded$fits[[best_id]]
+    extract_parameter_summary(fit_obj, trait_name, best_id, "additive_expanded")
+  }),
+  purrr::imap(results$log, function(rr, trait_name) {
+    tbl <- rr$expanded$table
+    if (nrow(tbl) == 0) return(NULL)
+    best_id <- tbl$Model[which.min(tbl$AICc)]
+    fit_obj <- rr$expanded$fits[[best_id]]
+    extract_parameter_summary(fit_obj, trait_name, best_id, "log_expanded")
+  })
+))
+
+# if a hessian-refined fit exists add that row and any saved SEs
+# to the same parameter summary table
+hess_rows <- safe_bind_rows(list(
+  purrr::imap(results$additive, function(rr, trait_name) {
+    if (is.null(rr$best_hessian)) return(NULL)
+    tib <- extract_parameter_summary(rr$best_hessian, trait_name, rr$best_hessian_id, "additive_expanded_hessian")
+    if (!is.null(rr$best_hessian$se)) {
+      for (nm in names(rr$best_hessian$se)) tib[[paste0("SE_", nm)]] <- rr$best_hessian$se[[nm]]
+    }
+    tib
+  }),
+  purrr::imap(results$log, function(rr, trait_name) {
+    if (is.null(rr$best_hessian)) return(NULL)
+    tib <- extract_parameter_summary(rr$best_hessian, trait_name, rr$best_hessian_id, "log_expanded_hessian")
+    if (!is.null(rr$best_hessian$se)) {
+      for (nm in names(rr$best_hessian$se)) tib[[paste0("SE_", nm)]] <- rr$best_hessian$se[[nm]]
+    }
+    tib
+  })
+))
+
+parameter_summary <- bind_rows(parameter_summary, hess_rows)
+write.csv(parameter_summary, file.path(tab_dir, "best_model_parameter_summary.csv"), row.names = FALSE)
+```
+
+# fitted trajectories
+
+```{r fitted-trajectories}
+make_trait_best_plot <- function(result_block, prep, scale_name, trait_name) {
+  tbl <- result_block$expanded$table
+  if (nrow(tbl) == 0) return(NULL)
+  best_id <- tbl$Model[which.min(tbl$AICc)]
+  best_fit <- result_block$expanded$fits[[best_id]]
+  out_path <- file.path(fig_dir, paste0("fit_", trait_name, "_", scale_name, "_", best_id, ".png"))
+  make_obs_fit_plot(prep = prep, fit = best_fit, trait_name = trait_name,
+                    model_name = best_id, scale_label = scale_name, out_path = out_path)
+}
+
+purrr::iwalk(results$additive, ~ make_trait_best_plot(.x, prep_map[[.y]], "additive", .y))
+purrr::iwalk(results$log, ~ make_trait_best_plot(.x, prep_map[[.y]], "log", .y))
+```
+
+# adequacy checks
+
+runs the bootstrap adequacy checks
+
+```{r adequacy-checks}
+adequacy_tables <- list()
+
+# the additive adequacy run checks the best baseline model, the best expanded
+# model, and the best variance-shift model for each trait
+adequacy_add <- list()
+for (trait_name in names(results$additive)) {
+  rr <- results$additive[[trait_name]]
+
+  if (nrow(rr$baseline$table) > 0) {
+    best_base <- rr$baseline$table$Model[which.min(rr$baseline$table$AICc)]
+    adequacy_add[[paste0(trait_name, "_baseline")]] <- bootstrap_adequacy(
+      trait_name = trait_name,
+      model_id = best_base,
+      fit = rr$baseline$fits[[best_base]],
+      y = rr$y,
+      Z_map = rr$Z_map,
+      B = nboot_baseline,
+      pool = pool_models,
+      seed = 2024
+    ) %>% mutate(Analysis_Set = "additive_baseline")
+  }
+
+  if (nrow(rr$expanded$table) > 0) {
+    best_exp <- rr$expanded$table$Model[which.min(rr$expanded$table$AICc)]
+    adequacy_add[[paste0(trait_name, "_expanded")]] <- bootstrap_adequacy(
+      trait_name = trait_name,
+      model_id = best_exp,
+      fit = rr$expanded$fits[[best_exp]],
+      y = rr$y,
+      Z_map = rr$Z_map,
+      B = nboot_covou,
+      pool = pool_models,
+      seed = 3024
+    ) %>% mutate(Analysis_Set = "additive_expanded")
+  }
+
+  if (nrow(rr$vshift$table) > 0) {
+    best_vs <- rr$vshift$table$Model[which.min(rr$vshift$table$AICc)]
+    adequacy_add[[paste0(trait_name, "_vshift")]] <- bootstrap_adequacy(
+      trait_name = trait_name,
+      model_id = best_vs,
+      fit = rr$vshift$fits[[best_vs]],
+      y = rr$y,
+      Z_map = rr$Z_map,
+      B = nboot_sensitivity,
+      gg = rr$gg_vshift,
+      pool = pool_models,
+      seed = 4024
+    ) %>% mutate(Analysis_Set = "additive_vshift_sensitivity")
+  }
+}
+
+adequacy_tables$additive <- safe_bind_rows(adequacy_add)
+write.csv(adequacy_tables$additive, file.path(tab_dir, "adequacy_bootstrap_additive.csv"), row.names = FALSE)
+
+# the log adequacy run follows the best expanded model for each trait
+adequacy_log <- list()
+for (trait_name in names(results$log)) {
+  rr <- results$log[[trait_name]]
+  if (nrow(rr$expanded$table) > 0) {
+    best_exp <- rr$expanded$table$Model[which.min(rr$expanded$table$AICc)]
+    adequacy_log[[trait_name]] <- bootstrap_adequacy(
+      trait_name = trait_name,
+      model_id = best_exp,
+      fit = rr$expanded$fits[[best_exp]],
+      y = rr$y,
+      Z_map = rr$Z_map,
+      B = nboot_covou,
+      pool = pool_models,
+      seed = 5024
+    ) %>% mutate(Analysis_Set = "log_expanded")
+  }
+}
+
+adequacy_tables$log <- safe_bind_rows(adequacy_log)
+write.csv(adequacy_tables$log, file.path(tab_dir, "adequacy_bootstrap_log.csv"), row.names = FALSE)
+```
+
+# saved objects
+
+```{r saved-objects}
+saveRDS(results, file.path(rds_dir, "full_analysis_results.rds"))
+saveRDS(prep_map, file.path(rds_dir, "prep_map.rds"))
+saveRDS(list(
+  trait_summary = trait_summary,
+  fdiff_cor_table = fdiff_cor_table,
+  ols_table = ols_table,
+  all_tables = all_tables,
+  parameter_summary = parameter_summary,
+  adequacy_tables = adequacy_tables
+), file.path(rds_dir, "analysis_tables_bundle.rds"))
+
+capture.output(sessionInfo(), file = file.path(output_dir, "sessionInfo.txt"))
+
+message("analysis completed; outputs written to ", output_dir)
+```
